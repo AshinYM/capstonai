@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!requirements-lock.txt
+!server.py
+!review/
+!review/*.py
+!web/
+!web/**
+!scripts/
+!scripts/db_snapshot.py

@@ -114,3 +114,63 @@ Windows: `.\.venv\Scripts\python.exe -m pytest -q`
 ```
 
 이 명령은 실제 유료 API를 사용합니다. 포함된 직접 작성 샘플로 질문·퀴즈·분할 요약·원문 대조·출처 조회를 검사하며 결과를 `data/openai_check.json`에 저장합니다. 키를 출력하지 않고 임시 DB를 사용하므로 기존 수업 자료와 대화는 건드리지 않습니다. 실행 중인 앱의 백엔드 설정도 바꾸지 않습니다. 키가 없으면 외부 요청 전에 종료합니다. 모의 테스트 통과와 실제 API 검증 통과를 구분하며, 실제 검증 결과 파일이 없으면 완료로 간주하지 않습니다.
+
+## 개인 고도화 1 — 로컬 컨테이너와 데이터 복구 (2026-10-29)
+
+처음 실행할 때 Python 환경을 따로 구성해야 하고 SQLite 데이터를 직접 복사하면 WAL의 최신 기록을 놓칠 수 있었습니다. 이번 개선은 실행 환경과 복구 방법을 재현 가능하게 만드는 데 집중했습니다. 검색·생성 알고리즘과 기존 API 응답은 변경하지 않았습니다.
+
+### Docker Compose 실행
+
+Docker와 Compose를 준비한 뒤 프로젝트 루트에서:
+
+```bash
+docker compose up -d --build --wait
+docker compose ps
+```
+
+접속 주소는 `http://127.0.0.1:8600`입니다. 기본 Compose는 **extractive(원문 발췌)** 모드이며 유료 모델을 호출하지 않습니다. `.env`, 개인 데이터, 강의자료, 발표 자료는 이미지 빌드에 포함하지 않습니다. 컨테이너는 일반 사용자 UID 10001로 실행하고 CPU 1개·메모리 1GB로 제한합니다. healthcheck는 앱의 응답 상태를 확인하며 답변 품질을 보장하는 검사는 아닙니다.
+
+자료·대화·요약 캐시는 `review-data` named volume에 저장합니다. `docker compose down` 후 다시 실행해도 유지되며 **`down -v`는 이 데이터를 삭제**합니다. 현재 앱은 개인용이므로 포트를 localhost에만 연결합니다. 공개 접속용 인증·사용자 격리는 이번 개선 범위가 아닙니다.
+
+### 로컬 Python 실행 환경의 백업·복구
+
+Python 표준 라이브러리만 사용하므로 모델·API 없이 실행할 수 있습니다. 백업은 SQLite backup API로 커밋된 WAL까지 일관되게 복사하고 무결성·필수 테이블을 검사합니다. 기존 출력 파일은 덮어쓰지 않습니다.
+
+```bash
+python scripts/db_snapshot.py backup --database data/review.db --output backups/review-20261029.db
+```
+
+복구할 때는 앱을 먼저 종료하고 **새 경로**를 지정합니다. 기존 DB와 WAL/SHM 파일을 임의로 덮어쓰지 않습니다.
+
+```bash
+python scripts/db_snapshot.py restore --snapshot backups/review-20261029.db --database data/restored.db
+REVIEW_DB="$PWD/data/restored.db" bash scripts/run.sh
+```
+
+백업에는 원문·대화·캐시가 포함될 수 있어 `backups/`를 Git에서 제외하며 파일 권한은 0600으로 생성합니다. 백업은 암호화 기능을 제공하지 않습니다.
+
+### 컨테이너 데이터의 백업·복구
+
+`/app/data`는 컨테이너 안의 영구 볼륨 경로입니다. 백업 파일 이름은 실행할 때마다 바꿉니다.
+
+```bash
+docker compose exec capstonai python scripts/db_snapshot.py backup --database /app/data/review.db --output /app/data/snapshots/review-20261029.db
+mkdir -p backups
+docker compose cp capstonai:/app/data/snapshots/review-20261029.db backups/review-20261029.db
+```
+
+같은 볼륨 안의 스냅샷은 볼륨 유실에 대비한 외부 백업이 아니므로 `compose cp`로 별도 보관합니다. 앱을 중지한 뒤 스냅샷을 새 DB로 복구할 수 있습니다.
+
+```bash
+docker compose stop capstonai
+docker compose run --rm --no-deps capstonai python scripts/db_snapshot.py restore --snapshot /app/data/snapshots/review-20261029.db --database /app/data/restored.db
+```
+
+복구본을 사용하려면 `compose.yaml`의 `REVIEW_DB`를 `/app/data/restored.db`로 변경한 후 `docker compose up -d --wait`로 실행합니다. 볼륨까지 잃은 경우에는 새 볼륨을 초기화한 뒤 외부 백업을 `compose cp`로 컨테이너 데이터 경로에 반입하고 소유권을 확인해야 합니다. 이 경우의 자동 복구는 아직 제공하지 않습니다.
+
+### 검증 범위
+
+- 기존 검사와 새 백업·복구 검사 합계 **36개 통과**. 커밋된 WAL 기록, 미커밋 기록 제외, 캐시 복구, 덮어쓰기 거부, 잘못된 DB·손상 파일 거부를 검사했습니다.
+- 로컬 Docker 이미지 빌드·Compose 설정·healthcheck를 확인했습니다(Apple Silicon 로컬 Docker, Linux ARM64 이미지). AMD64와 클라우드 환경은 별도 검증이 필요합니다.
+- 실제 컨테이너에서 직접 작성한 샘플 자료 등록 → 출처가 연결된 발췌 답변 → 컨테이너 재생성 → 동일 자료 유지 → 실행 중 DB 백업 → 새 DB로 복구한 자료·대화 확인까지 통과했습니다.
+- 외부 LLM 품질·클라우드 배포·동시 사용자 부하는 이번 검증에 포함하지 않았습니다.

@@ -1,0 +1,26 @@
+services:
+  capstonai:
+    build: .
+    ports:
+      - "127.0.0.1:8600:8600"
+    environment:
+      LLM_BACKEND: extractive
+      REVIEW_DB: /app/data/review.db
+      LANGSMITH_TRACING: "false"
+      LANGCHAIN_TRACING_V2: "false"
+    volumes:
+      - review-data:/app/data
+    restart: unless-stopped
+    init: true
+    cpus: 1
+    mem_limit: 1g
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8600/api/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  review-data:
